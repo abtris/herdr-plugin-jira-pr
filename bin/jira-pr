@@ -15,6 +15,7 @@ TOKEN_TTL_MS=900000
 SUMMARY_MAX=48
 JIRA_PROJECTS="KR,KRI"
 KEY_PATTERN=""
+NO_TICKET_BRANCHES='^(triage|docs|chore)/'
 LINK_WORDS='(fix(es|ed)?|close[sd]?|resolve[sd]?|implement(s|ed)?|relate[sd]? to|ticket|issue|jira)'
 JIRA_URL=""
 JIRA_AUTH="bearer"
@@ -216,6 +217,26 @@ extract_linked_keys() {
   } | tr '[:lower:]' '[:upper:]' | sort -u | head -3
 }
 
+# Triage and docs branches have no ticket by design, so a warning there is a
+# warning about nothing. Everywhere else, a missing key is worth flagging.
+missing_key_is_worth_warning() {
+  local branch="$1"
+  if [ -n "$NO_TICKET_BRANCHES" ] &&
+    printf '%s' "$branch" | grep -qiE "$NO_TICKET_BRANCHES"; then
+    return 1
+  fi
+  return 0
+}
+
+no_key_line() {
+  local number="$1" branch="$2"
+  if missing_key_is_worth_warning "$branch"; then
+    printf '⚠ #%s no Jira key' "$number"
+  else
+    printf '#%s' "$number"
+  fi
+}
+
 trim_summary() {
   local text="$1"
   if [ "${#text}" -gt "$SUMMARY_MAX" ]; then
@@ -312,10 +333,10 @@ compose() {
       if [ -n "$key" ]; then
         printf '#%s %s · jira?' "$number" "$key"
       else
-        printf '⚠ #%s no Jira key' "$number"
+        no_key_line "$number" "$branch"
       fi
       ;;
-    *) printf '⚠ #%s no Jira key' "$number" ;;
+    *) no_key_line "$number" "$branch" ;;
   esac
 }
 

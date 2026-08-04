@@ -149,10 +149,17 @@ run_case "KRI incident keys are recognized, not read as KR" \
   '[{"number":52,"title":"KRI-77 triage the cluster incident","body":""}]' \
   "$prefix --token jira=#52 KRI-77 Cluster incident triage · Open --ttl-ms 900000"
 
-run_case "a testbed name is not a ticket key" \
+# The triage branch also covers the no-warning path: kr-dev-44 is a testbed, and
+# triage work carries no ticket by design, so neither should produce a warning.
+run_case "a testbed name is not a ticket key, and triage is not warned about" \
   "triage/2026-08-04-reservation" \
   '[{"number":7,"title":"Triaged the dev kr-dev-44 reservation 400","body":"kr-dev-44 returned 400"}]' \
-  "$prefix --token jira=⚠ #7 no Jira key --ttl-ms 900000"
+  "$prefix --token jira=#7 --ttl-ms 900000"
+
+run_case "a feature branch with no ticket is still warned about" \
+  "feat/add-retry" \
+  '[{"number":54,"title":"add a retry","body":"no ticket for this"}]' \
+  "$prefix --token jira=⚠ #54 no Jira key --ttl-ms 900000"
 
 run_case "a branch that only looks like a key is ignored" \
   "fix/retry-2" \
