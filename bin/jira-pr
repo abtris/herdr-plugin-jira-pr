@@ -13,7 +13,9 @@ TOKEN_NAME="jira"
 CACHE_TTL=300
 TOKEN_TTL_MS=900000
 SUMMARY_MAX=48
-KEY_PATTERN='[A-Za-z][A-Za-z0-9]+-[0-9]+'
+JIRA_PROJECTS="KR,KRI"
+KEY_PATTERN=""
+LINK_WORDS='(fix(es|ed)?|close[sd]?|resolve[sd]?|implement(s|ed)?|relate[sd]? to|ticket|issue|jira)'
 JIRA_URL=""
 JIRA_AUTH="bearer"
 JIRA_LOGIN=""
@@ -35,6 +37,23 @@ if [ -z "$JIRA_URL" ] && [ -f "$JIRA_CLI_CONFIG" ]; then
   [ -n "$JIRA_LOGIN" ] || JIRA_LOGIN=$(sed -n 's/^login: *//p' "$JIRA_CLI_CONFIG" | head -1)
 fi
 JIRA_URL="${JIRA_URL%/}"
+
+# Restrict candidate keys to the project prefixes that actually exist here. This
+# is what keeps branch names like fix/retry-2 from ever looking like a ticket.
+# Longest prefix first, so KRI-1 is not read as the KR project.
+if [ -z "$KEY_PATTERN" ]; then
+  if [ -n "$JIRA_PROJECTS" ]; then
+    KEY_PATTERN="($(printf '%s' "$JIRA_PROJECTS" |
+      tr ',' '\n' |
+      sed 's/[[:space:]]//g' |
+      awk 'NF { print length, $0 }' |
+      sort -rn |
+      cut -d' ' -f2- |
+      paste -sd'|' -))-[0-9]+"
+  else
+    KEY_PATTERN='[A-Za-z][A-Za-z0-9]+-[0-9]+'
+  fi
+fi
 
 file_mtime() {
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
@@ -181,7 +200,20 @@ jira_issue_exists() {
 }
 
 extract_keys() {
-  printf '%s' "$1" | grep -oE "$KEY_PATTERN" 2>/dev/null | tr '[:lower:]' '[:upper:]' || true
+  printf '%s' "$1" | grep -oiE "$KEY_PATTERN" 2>/dev/null | tr '[:lower:]' '[:upper:]' || true
+}
+
+# A PR body mentions tickets in passing far too often for a bare key to mean
+# "this is the issue" — prose, examples, and follow-up notes all match. Only
+# count keys inside a Jira link or behind a linking word.
+extract_linked_keys() {
+  local text="$1"
+  {
+    printf '%s' "$text" | grep -oiE "browse/$KEY_PATTERN" | sed 's#.*/##' || true
+    printf '%s' "$text" |
+      grep -oiE "${LINK_WORDS}[[:space:]:#-]*$KEY_PATTERN" |
+      grep -oiE "$KEY_PATTERN" || true
+  } | tr '[:lower:]' '[:upper:]' | sort -u | head -3
 }
 
 trim_summary() {
@@ -238,7 +270,7 @@ compose() {
 
   branch_keys=$(extract_keys "$branch")
   title_keys=$(extract_keys "$title")
-  body_keys=$(extract_keys "${body:-}" | head -3)
+  body_keys=$(extract_linked_keys "${body:-}")
 
   candidates=""
   for key in $branch_keys; do candidates+="$key${TAB}branch"$'\n'; done

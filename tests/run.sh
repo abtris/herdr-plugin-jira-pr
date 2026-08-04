@@ -110,6 +110,7 @@ run_case() {
 
 jira_issue_fixture KR-1234 "Fix retry loop" "In Review"
 jira_issue_fixture KR-1240 "Unrelated work" "Backlog"
+jira_issue_fixture KRI-77 "Cluster incident triage" "Open"
 
 prefix="pane report-metadata w1:p1 --source abtris.jira-pr"
 
@@ -127,6 +128,36 @@ run_case "key only in the PR title" \
   "quick-cleanup" \
   '[{"number":46,"title":"KR-1234 Fix retry loop","body":""}]' \
   "$prefix --token jira=#46 KR-1234 Fix retry loop · In Review --ttl-ms 900000"
+
+run_case "a key merely mentioned in the body does not count" \
+  "tidy-things" \
+  '[{"number":49,"title":"tidy up the config","body":"the row looks like #45 KR-1234 Fix the retry loop"}]' \
+  "$prefix --token jira=⚠ #49 no Jira key --ttl-ms 900000"
+
+run_case "a key behind a linking word in the body counts" \
+  "tidy-things" \
+  '[{"number":50,"title":"tidy up the config","body":"Fixes KR-1234 as a side effect"}]' \
+  "$prefix --token jira=#50 KR-1234 Fix retry loop · In Review --ttl-ms 900000"
+
+run_case "a key in a Jira link in the body counts" \
+  "tidy-things" \
+  '[{"number":51,"title":"tidy up the config","body":"http://jira.test/browse/KR-1240 has context"}]' \
+  "$prefix --token jira=#51 KR-1240 Unrelated work · Backlog --ttl-ms 900000"
+
+run_case "KRI incident keys are recognized, not read as KR" \
+  "triage/kri-77-cluster" \
+  '[{"number":52,"title":"KRI-77 triage the cluster incident","body":""}]' \
+  "$prefix --token jira=#52 KRI-77 Cluster incident triage · Open --ttl-ms 900000"
+
+run_case "a testbed name is not a ticket key" \
+  "triage/2026-08-04-reservation" \
+  '[{"number":7,"title":"Triaged the dev kr-dev-44 reservation 400","body":"kr-dev-44 returned 400"}]' \
+  "$prefix --token jira=⚠ #7 no Jira key --ttl-ms 900000"
+
+run_case "a branch that only looks like a key is ignored" \
+  "fix/retry-2" \
+  '[{"number":53,"title":"retry twice before giving up","body":""}]' \
+  "$prefix --token jira=⚠ #53 no Jira key --ttl-ms 900000"
 
 run_case "no Jira key anywhere" \
   "tidy-things" \
