@@ -22,6 +22,7 @@ JIRA_AUTH="bearer"
 JIRA_LOGIN=""
 JIRA_API_TOKEN="${JIRA_API_TOKEN:-}"
 JIRA_API_TOKEN_CMD=""
+TOKEN_CMD_TIMEOUT=10
 GH_ACCOUNTS="ladislav@prskavec.net=abtris;lprskavec@purestorage.com=lprskavec_pure"
 
 if [ -f "$CONFIG_DIR/config.env" ]; then
@@ -60,11 +61,27 @@ file_mtime() {
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
 }
 
+# Bounds a command's wall clock. The token command reaches a secret manager, and a
+# locked vault would otherwise leave an event hook hanging on every pane focus.
+bounded() {
+  local secs="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
 jira_token() {
   if [ -n "$JIRA_API_TOKEN" ]; then
     printf '%s' "$JIRA_API_TOKEN"
   elif [ -n "$JIRA_API_TOKEN_CMD" ]; then
-    eval "$JIRA_API_TOKEN_CMD" 2>/dev/null || true
+    bounded "$TOKEN_CMD_TIMEOUT" sh -c "$JIRA_API_TOKEN_CMD" 2>/dev/null || true
   fi
 }
 
@@ -99,9 +116,11 @@ pane_cwd() {
       return
     fi
   done
+  # `pane get` wraps the pane in .result.pane, unlike `pane list`, which uses
+  # .result.panes. Tolerate both shapes and a bare pane object.
   "$HERDR" pane get "$target" 2>/dev/null |
-    jq -r 'if has("result") then .result else . end | .foreground_cwd // .cwd // empty' \
-      2>/dev/null || true
+    jq -r 'if has("result") then .result else . end | (.pane // .) |
+      .foreground_cwd // .cwd // empty' 2>/dev/null || true
 }
 
 # --- GitHub ------------------------------------------------------------------
@@ -170,6 +189,18 @@ find_pr() {
 
 # Prints "summary<TAB>status". Exit 3 = no such issue, 4 = Jira could not be
 # consulted at all (missing token, network, auth).
+# Populates JIRA_AUTH_ARGS for curl. Bearer is the personal access token form used
+# by Jira Data Center; basic pairs JIRA_LOGIN with the token, as Jira Cloud wants.
+JIRA_AUTH_ARGS=()
+jira_auth_args() {
+  local token="$1"
+  if [ "$JIRA_AUTH" = "basic" ]; then
+    JIRA_AUTH_ARGS=(-u "$JIRA_LOGIN:$token")
+  else
+    JIRA_AUTH_ARGS=(-H "Authorization: Bearer $token")
+  fi
+}
+
 jira_issue() {
   local key="$1" token response code body
   local -a auth
@@ -177,11 +208,8 @@ jira_issue() {
   if [ -z "$JIRA_URL" ] || [ -z "$token" ]; then
     return 4
   fi
-  if [ "$JIRA_AUTH" = "basic" ]; then
-    auth=(-u "$JIRA_LOGIN:$token")
-  else
-    auth=(-H "Authorization: Bearer $token")
-  fi
+  jira_auth_args "$token"
+  auth=("${JIRA_AUTH_ARGS[@]}")
   response=$(curl -sS -m 8 -w '\n%{http_code}' "${auth[@]}" \
     -H 'Accept: application/json' \
     "$JIRA_URL/rest/api/2/issue/$key?fields=summary,status" 2>/dev/null || true)
@@ -239,8 +267,14 @@ no_key_line() {
 
 trim_summary() {
   local text="$1"
+  # Real Jira summaries carry stray leading and trailing whitespace, which would
+  # show up in the line as a doubled separator.
+  text="${text#"${text%%[![:space:]]*}"}"
+  text="${text%"${text##*[![:space:]]}"}"
   if [ "${#text}" -gt "$SUMMARY_MAX" ]; then
-    printf '%s…' "${text:0:$SUMMARY_MAX}"
+    text="${text:0:$SUMMARY_MAX}"
+    text="${text%"${text##*[![:space:]]}"}"
+    printf '%s…' "$text"
   else
     printf '%s' "$text"
   fi
@@ -401,10 +435,36 @@ cmd_doctor() {
   printf 'sidebar token $%s\n' "$TOKEN_NAME"
   printf 'jira url      %s\n' "${JIRA_URL:-(unset)}"
   printf 'jira auth     %s\n' "$JIRA_AUTH"
-  if [ -n "$(jira_token)" ]; then
-    printf 'jira token    found\n'
+  local token code who
+  token=$(jira_token)
+  if [ -n "$token" ]; then
+    if [ -n "$JIRA_API_TOKEN_CMD" ]; then
+      printf 'jira token    %s chars, from JIRA_API_TOKEN_CMD\n' "${#token}"
+    else
+      printf 'jira token    %s chars, from JIRA_API_TOKEN\n' "${#token}"
+    fi
+    # One request, so a rejected token is obvious here instead of showing up as a
+    # sidebar full of "jira?". On-prem Jira can lock an account after repeated
+    # failures, so this deliberately does not retry or try other auth modes.
+    jira_auth_args "$token"
+    code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "${JIRA_AUTH_ARGS[@]}" \
+      -H 'Accept: application/json' "$JIRA_URL/rest/api/2/myself" 2>/dev/null || true)
+    case "$code" in
+      200)
+        who=$(curl -sS -m 10 "${JIRA_AUTH_ARGS[@]}" -H 'Accept: application/json' \
+          "$JIRA_URL/rest/api/2/myself" 2>/dev/null | jq -r '.name // "?"' 2>/dev/null)
+        printf 'jira auth     HTTP 200 as %s\n' "${who:-?}"
+        ;;
+      401 | 403)
+        printf 'jira auth     HTTP %s — token rejected, or this instance restricts\n' "$code"
+        printf '              /myself. Confirm with: jira issue view <KEY>\n'
+        ;;
+      429) printf 'jira auth     HTTP 429 — rate limited, wait before retrying\n' ;;
+      *) printf 'jira auth     HTTP %s\n' "${code:-no response}" ;;
+    esac
   else
-    printf 'jira token    MISSING — set JIRA_API_TOKEN in %s/config.env\n' "$CONFIG_DIR"
+    printf 'jira token    MISSING — set JIRA_API_TOKEN or JIRA_API_TOKEN_CMD in\n'
+    printf '              %s/config.env\n' "$CONFIG_DIR"
   fi
   for tool in git gh jq curl; do
     if command -v "$tool" >/dev/null 2>&1; then
