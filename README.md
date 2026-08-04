@@ -63,23 +63,37 @@ over the current pane:
   j  KR-1234 in Jira
   a  assign a ticket…
   c  clear assigned KR-1234
+  r  refresh now
 
   esc  cancel
 ```
 
-`p` opens the pull request in a browser, `j` opens the issue. `a` prompts for a
-key and pins it to this repo and branch, which is how you attach a ticket to work
-whose branch name does not carry one. A pinned ticket outranks the branch, is
-checked against Jira before it is accepted, and inherits the same expectation:
-it has to appear in the PR title. With no PR yet, a pinned ticket still shows, so
-you can see what an agent is supposed to be working on before it opens anything.
+`p` opens the pull request in a browser, `j` opens the issue, `r` re-resolves
+immediately instead of waiting for the cache to expire. `a` prompts for a key and
+pins it to this repo and branch, which is how you attach a ticket to work whose
+branch name does not carry one. A pinned ticket outranks the branch, is checked
+against Jira before it is accepted, and inherits the same expectation: it has to
+appear in the PR title. With no PR yet, a pinned ticket still shows, so you can see
+what an agent is supposed to be working on before it opens anything.
 
 ```toml
 [[keys.command]]
-key = "prefix+o"
+key = "cmd+j"
 type = "shell"
 command = "herdr plugin pane open --plugin abtris.jira-pr --entrypoint menu"
 ```
+
+**Pick a key Herdr does not already use.** A custom binding that collides with a
+built-in is silently disabled — no error, the key simply keeps doing its old job.
+In the `prefix+` namespace that rules out most letters: `prefix+o` is
+`open_notification_target` and `prefix+j` is `focus_pane_down`, so both look
+tempting and neither works. Run `herdr --default-config` and grep for `prefix+`
+before choosing.
+
+A direct `cmd+` chord sidesteps that namespace entirely, since Herdr binds no
+`cmd+` keys by default. It does require your terminal to forward the chord rather
+than consume it — on Ghostty, check that nothing in its own config binds
+`super+<key>`.
 
 ## Reading the ticket back
 
@@ -132,15 +146,9 @@ rows = [
 ]
 ```
 
-A key for refreshing on demand, which is useful right after you open a PR:
-
-```toml
-[[keys.command]]
-key = "prefix+j"
-type = "plugin_action"
-command = "abtris.jira-pr.refresh-forced"
-description = "refresh Jira/PR line"
-```
+Then bind the popup as shown above. Refreshing on demand lives in the popup under
+`r`, so one binding covers everything; `abtris.jira-pr.refresh-forced` is still
+available as a `plugin_action` binding if you would rather have a dedicated key.
 
 Reload with `herdr server reload-config`.
 

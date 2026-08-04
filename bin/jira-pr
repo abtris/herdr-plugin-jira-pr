@@ -570,6 +570,7 @@ cmd_menu() {
   if [ -n "$pin" ]; then
     menu_row c "clear assigned $pin"
   fi
+  menu_row r 'refresh now'
   printf '\n  esc  cancel\n'
 
   read -rsn1 choice || return 0
@@ -603,6 +604,12 @@ cmd_menu() {
       ;;
     c)
       rm -f "$(pin_file "$repo_root" "$branch")"
+      invalidate "$repo_root" "$branch"
+      value=$(resolve "$repo_root" "$branch")
+      IFS="$SEP" read -r line _ key <<<"$value"
+      report "$target" "$line" "$key"
+      ;;
+    r)
       invalidate "$repo_root" "$branch"
       value=$(resolve "$repo_root" "$branch")
       IFS="$SEP" read -r line _ key <<<"$value"
