@@ -27,11 +27,16 @@ when Jira could not be reached. With no PR for the branch, the line disappears.
 
 ## How it decides
 
-Candidate issue keys come from the branch name, the PR title, and the first
-three keys in the PR body, in that order. The plugin looks each candidate up in
-Jira and takes the first one that exists. That lookup is what makes the
-branch-name heuristic safe: a branch called `fix/retry-2` produces the candidate
-`RETRY-2`, which Jira rejects, so it never reaches the sidebar.
+Candidate issue keys come from the branch name, the PR title, and the PR body,
+in that order. The plugin looks each candidate up in Jira and takes the first one
+that exists.
+
+Two filters keep noise out of the sidebar. Keys must carry one of the project
+prefixes in `JIRA_PROJECTS` (`KR,KRI` by default), so a branch called
+`fix/retry-2` never looks like a ticket. And a key in the PR body counts only
+inside a Jira link or behind a linking word such as `fixes` or `resolves` —
+bodies mention tickets in passing far too often for a bare key to mean "this is
+the issue".
 
 The mismatch warning fires only when the branch and the PR each name a
 *different issue that exists*. One side being silent is normal and not worth a
