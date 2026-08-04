@@ -1,0 +1,36 @@
+id = "abtris.jira-pr"
+name = "Jira PR"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Show the Jira issue linked to the current branch's pull request, and flag when they disagree"
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "refresh"
+title = "Refresh Jira/PR line"
+contexts = ["pane"]
+command = ["bash", "bin/jira-pr", "refresh"]
+
+[[actions]]
+id = "refresh-forced"
+title = "Refresh Jira/PR line (ignore cache)"
+contexts = ["pane"]
+command = ["bash", "bin/jira-pr", "refresh", "--force"]
+
+[[actions]]
+id = "doctor"
+title = "Check Jira/PR plugin setup"
+contexts = ["global"]
+command = ["bash", "bin/jira-pr", "doctor"]
+
+[[events]]
+on = "pane.focused"
+command = ["bash", "bin/jira-pr", "refresh"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["bash", "bin/jira-pr", "refresh"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bash", "bin/jira-pr", "refresh"]

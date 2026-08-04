@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Functional tests for bin/jira-pr. Stubs herdr, gh, and curl, so nothing here
+# touches the network or a running Herdr server.
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+stub_bin="$work/bin"
+mkdir -p "$stub_bin" "$work/jira"
+
+cat >"$stub_bin/herdr" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_HERDR_LOG"
+EOF
+
+cat >"$stub_bin/gh" <<'EOF'
+#!/usr/bin/env bash
+# Only `gh pr list` is exercised; STUB_PR_JSON is the canned response.
+if [ "${1:-}" = "auth" ]; then
+  exit 0
+fi
+printf '%s' "${STUB_PR_JSON:-[]}"
+EOF
+
+cat >"$stub_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+# Mimics `curl -w '\n%{http_code}'`: body, newline, status code.
+url=""
+for arg in "$@"; do
+  case "$arg" in
+    http*) url="$arg" ;;
+  esac
+done
+key="${url##*/issue/}"
+key="${key%%\?*}"
+if [ "${STUB_JIRA_DOWN:-0}" = "1" ]; then
+  printf '\n000'
+  exit 0
+fi
+if [ -f "$STUB_JIRA_DIR/$key.json" ]; then
+  printf '%s\n200' "$(cat "$STUB_JIRA_DIR/$key.json")"
+else
+  printf '{"errorMessages":["Issue Does Not Exist"]}\n404'
+fi
+EOF
+
+chmod +x "$stub_bin"/*
+
+# A real git repo, because the script asks git for the branch and remote.
+repo="$work/repo"
+mkdir -p "$repo"
+git -C "$repo" -c init.templateDir= init -q
+git -C "$repo" config user.email tester@example.com
+git -C "$repo" config user.name Tester
+git -C "$repo" remote add origin git@github.com:abtris/example.git
+git -C "$repo" commit -q --allow-empty -m init
+
+config_dir="$work/config"
+mkdir -p "$config_dir"
+cat >"$config_dir/config.env" <<EOF
+JIRA_URL=http://jira.test
+JIRA_API_TOKEN=stub-token
+GH_ACCOUNTS=
+EOF
+
+jira_issue_fixture() {
+  cat >"$work/jira/$1.json" <<EOF
+{"fields":{"summary":"$2","status":{"name":"$3"}}}
+EOF
+}
+
+failures=0
+pass() { printf '  ok   %s\n' "$1"; }
+fail() {
+  printf '  FAIL %s\n         want: %s\n         got:  %s\n' "$1" "$2" "$3"
+  failures=$((failures + 1))
+}
+
+# Runs bin/jira-pr on a branch and prints what it reported to herdr.
+run_case() {
+  local name="$1" branch="$2" pr_json="$3" want="$4" down="${5:-0}"
+  local log="$work/herdr.log" got
+  : >"$log"
+  git -C "$repo" checkout -q -B "$branch"
+  got=$(
+    PATH="$stub_bin:$PATH" \
+    STUB_HERDR_LOG="$log" \
+    STUB_JIRA_DIR="$work/jira" \
+    STUB_JIRA_DOWN="$down" \
+    STUB_PR_JSON="$pr_json" \
+    HERDR_BIN_PATH="$stub_bin/herdr" \
+    HERDR_PANE_ID="w1:p1" \
+    HERDR_PLUGIN_CONFIG_DIR="$config_dir" \
+    HERDR_PLUGIN_STATE_DIR="$work/state-$RANDOM" \
+    HERDR_PLUGIN_CONTEXT_JSON="{\"focused_pane_id\":\"w1:p1\",\"focused_pane_cwd\":\"$repo\"}" \
+      bash "$root/bin/jira-pr" refresh >/dev/null 2>"$work/stderr" || {
+      printf 'script exited %s; stderr: %s' "$?" "$(cat "$work/stderr")"
+      return
+    }
+    cat "$log"
+  )
+  if [ "$got" = "$want" ]; then
+    pass "$name"
+  else
+    fail "$name" "$want" "$got"
+  fi
+}
+
+jira_issue_fixture KR-1234 "Fix retry loop" "In Review"
+jira_issue_fixture KR-1240 "Unrelated work" "Backlog"
+
+prefix="pane report-metadata w1:p1 --source abtris.jira-pr"
+
+run_case "branch and PR agree" \
+  "feat/kr-1234-retry" \
+  '[{"number":45,"title":"KR-1234 Fix retry loop","body":"see KR-1234"}]' \
+  "$prefix --token jira=#45 KR-1234 Fix retry loop · In Review --ttl-ms 900000"
+
+run_case "branch and PR name different real issues" \
+  "feat/kr-1234-retry" \
+  '[{"number":45,"title":"KR-1240 something else","body":""}]' \
+  "$prefix --token jira=⚠ #45 KR-1234 (branch) ≠ KR-1240 (PR) --ttl-ms 900000"
+
+run_case "key only in the PR title" \
+  "quick-cleanup" \
+  '[{"number":46,"title":"KR-1234 Fix retry loop","body":""}]' \
+  "$prefix --token jira=#46 KR-1234 Fix retry loop · In Review --ttl-ms 900000"
+
+run_case "no Jira key anywhere" \
+  "tidy-things" \
+  '[{"number":47,"title":"tidy up the config","body":"no ticket"}]' \
+  "$prefix --token jira=⚠ #47 no Jira key --ttl-ms 900000"
+
+run_case "key that does not exist in Jira" \
+  "feat/kr-9999-ghost" \
+  '[{"number":48,"title":"KR-9999 ghost issue","body":""}]' \
+  "$prefix --token jira=⚠ #48 KR-9999 not in Jira --ttl-ms 900000"
+
+run_case "no PR for this branch clears the line" \
+  "local-only" \
+  '[]' \
+  "$prefix --clear-token jira"
+
+run_case "Jira unreachable keeps the key but flags it" \
+  "feat/kr-1234-retry" \
+  '[{"number":45,"title":"KR-1234 Fix retry loop","body":""}]' \
+  "$prefix --token jira=#45 KR-1234 · jira? --ttl-ms 900000" \
+  1
+
+if [ "$failures" -gt 0 ]; then
+  printf '\n%s test(s) failed\n' "$failures"
+  exit 1
+fi
+printf '\nall tests passed\n'
