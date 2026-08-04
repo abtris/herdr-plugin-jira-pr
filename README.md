@@ -59,14 +59,17 @@ over the current pane:
 ```
   Jira PR — lprskavec/KR-1234-retry
 
-  p  #45 KR-1234 Fix the retry loop · In Review
-  j  KR-1234 in Jira
-  a  assign a ticket…
-  c  clear assigned KR-1234
-  r  refresh now
+   ▸ p  #45 KR-1234 Fix the retry loop · In Review
+     j  KR-1234 in Jira
+     a  assign a ticket…
+     c  clear assigned KR-1234
+     r  refresh now
 
-  esc  cancel
+  ↑↓ move · enter select · esc close
 ```
+
+Move with the arrow keys and hit enter, or press the letter shown against a row.
+Escape closes the menu, and also backs out of the ticket prompt.
 
 `p` opens the pull request in a browser, `j` opens the issue, `r` re-resolves
 immediately instead of waiting for the cache to expire. `a` prompts for a key and
@@ -75,6 +78,9 @@ branch name does not carry one. A pinned ticket outranks the branch, is checked
 against Jira before it is accepted, and inherits the same expectation: it has to
 appear in the PR title. With no PR yet, a pinned ticket still shows, so you can see
 what an agent is supposed to be working on before it opens anything.
+
+Assigning, clearing, and refreshing leave the menu open on the updated state;
+only the two browser actions close it.
 
 ```toml
 [[keys.command]]

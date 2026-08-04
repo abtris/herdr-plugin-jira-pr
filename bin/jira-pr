@@ -12,21 +12,24 @@ SOURCE_ID="abtris.jira-pr"
 CONFIG_DIR="${HERDR_PLUGIN_CONFIG_DIR:-$HOME/.config/herdr/plugins/$SOURCE_ID}"
 STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-${TMPDIR:-/tmp}/$SOURCE_ID}"
 
-TOKEN_NAME="jira"
-CACHE_TTL=300
-TOKEN_TTL_MS=900000
-SUMMARY_MAX=48
-JIRA_PROJECTS="KR,KRI"
-KEY_PATTERN=""
-LINK_WORDS='(fix(es|ed)?|close[sd]?|resolve[sd]?|implement(s|ed)?|relate[sd]? to|ticket|issue|jira)'
-JIRA_URL=""
-JIRA_AUTH="bearer"
-JIRA_LOGIN=""
+# Defaults, overridable by config.env and by the environment. Every one of these
+# reads through ${VAR:-...} so an exported value survives; a bare assignment would
+# quietly discard it, which is how OPEN_CMD once fell through to the real browser.
+TOKEN_NAME="${TOKEN_NAME:-jira}"
+CACHE_TTL="${CACHE_TTL:-300}"
+TOKEN_TTL_MS="${TOKEN_TTL_MS:-900000}"
+SUMMARY_MAX="${SUMMARY_MAX:-48}"
+JIRA_PROJECTS="${JIRA_PROJECTS:-KR,KRI}"
+KEY_PATTERN="${KEY_PATTERN:-}"
+LINK_WORDS="${LINK_WORDS:-(fix(es|ed)?|close[sd]?|resolve[sd]?|implement(s|ed)?|relate[sd]? to|ticket|issue|jira)}"
+JIRA_URL="${JIRA_URL:-}"
+JIRA_AUTH="${JIRA_AUTH:-bearer}"
+JIRA_LOGIN="${JIRA_LOGIN:-}"
 JIRA_API_TOKEN="${JIRA_API_TOKEN:-}"
-JIRA_API_TOKEN_CMD=""
-TOKEN_CMD_TIMEOUT=10
-GH_ACCOUNTS="ladislav@prskavec.net=abtris;lprskavec@purestorage.com=lprskavec_pure"
-OPEN_CMD=""
+JIRA_API_TOKEN_CMD="${JIRA_API_TOKEN_CMD:-}"
+TOKEN_CMD_TIMEOUT="${TOKEN_CMD_TIMEOUT:-10}"
+GH_ACCOUNTS="${GH_ACCOUNTS-ladislav@prskavec.net=abtris;lprskavec@purestorage.com=lprskavec_pure}"
+OPEN_CMD="${OPEN_CMD:-}"
 
 if [ -f "$CONFIG_DIR/config.env" ]; then
   set -a
@@ -534,90 +537,185 @@ open_url() {
 
 # --- popup -------------------------------------------------------------------
 
-# Herdr gives a popup entrypoint a real terminal, so this draws its own frame and
-# reads one keystroke. Popups get no HERDR_PANE_ID; the underlying pane arrives
+# Herdr gives a popup entrypoint a real terminal, so the menu draws itself and
+# reads keys directly. Popups get no HERDR_PANE_ID; the underlying pane arrives
 # through HERDR_PLUGIN_CONTEXT_JSON, which pane_id and pane_cwd already handle.
-menu_row() {
-  printf '  %s  %s\n' "$1" "$2"
+
+# Bash 3.2, still the system bash on macOS, rejects a fractional read timeout. It
+# is only used to tell a bare Escape from an arrow key, so a whole second there is
+# survivable; anything newer feels instant.
+ESC_TIMEOUT=0.05
+if [ "${BASH_VERSINFO[0]:-3}" -lt 4 ]; then
+  ESC_TIMEOUT=1
+fi
+
+MENU_KEYS=()
+MENU_LABELS=()
+MENU_CHOICE=""
+
+menu_add() {
+  MENU_KEYS+=("$1")
+  MENU_LABELS+=("$2")
+}
+
+menu_render() {
+  local selected="$1" title="$2" idx
+  printf '\033[H\033[2J'
+  printf '\n  \033[1mJira PR\033[0m — %s\n\n' "$title"
+  for idx in "${!MENU_KEYS[@]}"; do
+    if [ "$idx" -eq "$selected" ]; then
+      printf '  \033[7m ▸ %s  %s \033[0m\n' "${MENU_KEYS[$idx]}" "${MENU_LABELS[$idx]}"
+    else
+      printf '     %s  %s\n' "${MENU_KEYS[$idx]}" "${MENU_LABELS[$idx]}"
+    fi
+  done
+  printf '\n  \033[2m↑↓ move · enter select · esc close\033[0m\n'
+}
+
+# Sets MENU_CHOICE to the chosen key. Returns 1 on Escape or closed input, which
+# is what makes Escape work everywhere rather than only at the top level.
+menu_select() {
+  local title="$1" selected=0 count="${#MENU_KEYS[@]}" ch rest idx
+  [ "$count" -gt 0 ] || return 1
+  while true; do
+    menu_render "$selected" "$title"
+    IFS= read -rsn1 ch || return 1
+    case "$ch" in
+      $'\e')
+        rest=""
+        IFS= read -rsn2 -t "$ESC_TIMEOUT" rest || true
+        case "$rest" in
+          '[A') selected=$(((selected - 1 + count) % count)) ;;
+          '[B') selected=$(((selected + 1) % count)) ;;
+          '') return 1 ;;
+          *) ;;
+        esac
+        ;;
+      '')
+        MENU_CHOICE="${MENU_KEYS[$selected]}"
+        return 0
+        ;;
+      *)
+        for idx in "${!MENU_KEYS[@]}"; do
+          if [ "${MENU_KEYS[$idx]}" = "$ch" ]; then
+            MENU_CHOICE="$ch"
+            return 0
+          fi
+        done
+        ;;
+    esac
+  done
+}
+
+# Reads a line one key at a time, so Escape cancels. `read -r` cannot do this: to
+# it Escape is just another character in the line.
+PROMPT_RESULT=""
+prompt_line() {
+  local label="$1" ch
+  PROMPT_RESULT=""
+  printf '\n  %s' "$label"
+  while true; do
+    IFS= read -rsn1 ch || return 1
+    case "$ch" in
+      $'\e') return 1 ;;
+      '') return 0 ;;
+      $'\177' | $'\b')
+        if [ -n "$PROMPT_RESULT" ]; then
+          PROMPT_RESULT="${PROMPT_RESULT%?}"
+          printf '\b \b'
+        fi
+        ;;
+      *)
+        PROMPT_RESULT="$PROMPT_RESULT$ch"
+        printf '%s' "$ch"
+        ;;
+    esac
+  done
+}
+
+pause_message() {
+  printf '\n  %s\n  \033[2mpress any key\033[0m\n' "$1"
+  IFS= read -rsn1 _ || true
+}
+
+# Prompts for a ticket, validates it, and pins it to this repo and branch.
+menu_assign() {
+  local repo_root="$1" branch="$2" entry
+  if ! prompt_line "ticket: "; then
+    return 0
+  fi
+  entry=$(printf '%s' "$PROMPT_RESULT" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+  if [ -z "$entry" ]; then
+    return 0
+  fi
+  if ! printf '%s' "$entry" | grep -qiE "^$KEY_PATTERN$"; then
+    pause_message "$entry does not look like a ticket key."
+    return 0
+  fi
+  # Confirm it exists before pinning, so a typo does not become the answer. With
+  # no token there is nothing to check against, so accept it.
+  if [ -n "$(jira_token)" ] && ! jira_issue_exists "$entry"; then
+    pause_message "$entry is not in Jira."
+    return 0
+  fi
+  mkdir -p "$STATE_DIR/pins"
+  printf '%s' "$entry" >"$(pin_file "$repo_root" "$branch")"
 }
 
 cmd_menu() {
-  local target repo repo_root branch value line pr_url key choice entry pin
+  local target repo repo_root branch value line pr_url key pin
 
   target=$(pane_id)
   repo=$(pane_repo "$target")
   if [ -z "$repo" ]; then
-    printf '\n  Not a git branch in this pane.\n\n  press any key\n'
-    read -rsn1 _ || true
+    pause_message "Not a git branch in this pane."
     return 0
   fi
   IFS="$SEP" read -r repo_root branch <<<"$repo"
 
-  value=$(resolve "$repo_root" "$branch")
-  IFS="$SEP" read -r line pr_url key <<<"$value"
-  pin=$(read_pin "$repo_root" "$branch")
+  while true; do
+    value=$(resolve "$repo_root" "$branch")
+    IFS="$SEP" read -r line pr_url key <<<"$value"
+    pin=$(read_pin "$repo_root" "$branch")
 
-  printf '\n  Jira PR — %s\n\n' "$branch"
-  if [ -n "$pr_url" ]; then
-    menu_row p "${line:-open the pull request}"
-  else
-    menu_row ' ' 'no pull request for this branch'
-  fi
-  if [ -n "$key" ]; then
-    menu_row j "$key in Jira"
-  fi
-  menu_row a 'assign a ticket…'
-  if [ -n "$pin" ]; then
-    menu_row c "clear assigned $pin"
-  fi
-  menu_row r 'refresh now'
-  printf '\n  esc  cancel\n'
+    MENU_KEYS=()
+    MENU_LABELS=()
+    if [ -n "$pr_url" ]; then
+      menu_add p "${line:-open the pull request}"
+    fi
+    if [ -n "$key" ]; then
+      menu_add j "$key in Jira"
+    fi
+    menu_add a 'assign a ticket…'
+    if [ -n "$pin" ]; then
+      menu_add c "clear assigned $pin"
+    fi
+    menu_add r 'refresh now'
 
-  read -rsn1 choice || return 0
-  case "$choice" in
-    p) open_url "$pr_url" ;;
-    j) [ -n "$key" ] && open_url "$JIRA_URL/browse/$key" ;;
-    a)
-      printf '\n  ticket: '
-      read -r entry || return 0
-      entry=$(printf '%s' "$entry" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
-      if [ -z "$entry" ]; then
+    menu_select "$branch" || return 0
+
+    case "$MENU_CHOICE" in
+      p)
+        open_url "$pr_url"
         return 0
-      fi
-      if ! printf '%s' "$entry" | grep -qiE "^$KEY_PATTERN$"; then
-        printf '  %s does not look like a ticket key.\n  press any key\n' "$entry"
-        read -rsn1 _ || true
+        ;;
+      j)
+        open_url "$JIRA_URL/browse/$key"
         return 0
-      fi
-      # Confirm it exists before pinning, so a typo does not become the answer.
-      if ! jira_issue_exists "$entry" && [ -n "$(jira_token)" ]; then
-        printf '  %s is not in Jira.\n  press any key\n' "$entry"
-        read -rsn1 _ || true
-        return 0
-      fi
-      mkdir -p "$STATE_DIR/pins"
-      printf '%s' "$entry" >"$(pin_file "$repo_root" "$branch")"
-      invalidate "$repo_root" "$branch"
-      value=$(resolve "$repo_root" "$branch")
-      IFS="$SEP" read -r line _ key <<<"$value"
-      report "$target" "$line" "$key"
-      ;;
-    c)
-      rm -f "$(pin_file "$repo_root" "$branch")"
-      invalidate "$repo_root" "$branch"
-      value=$(resolve "$repo_root" "$branch")
-      IFS="$SEP" read -r line _ key <<<"$value"
-      report "$target" "$line" "$key"
-      ;;
-    r)
-      invalidate "$repo_root" "$branch"
-      value=$(resolve "$repo_root" "$branch")
-      IFS="$SEP" read -r line _ key <<<"$value"
-      report "$target" "$line" "$key"
-      ;;
-  esac
+        ;;
+      a) menu_assign "$repo_root" "$branch" ;;
+      c) rm -f "$(pin_file "$repo_root" "$branch")" ;;
+      r) ;;
+    esac
+
+    # Every mutating choice re-resolves on the next pass, so the menu shows the
+    # new state instead of closing on you.
+    invalidate "$repo_root" "$branch"
+    value=$(resolve "$repo_root" "$branch")
+    IFS="$SEP" read -r line _ key <<<"$value"
+    report "$target" "$line" "$key"
+  done
 }
-
 cmd_doctor() {
   local tool
   printf 'plugin        %s\n' "$SOURCE_ID"
