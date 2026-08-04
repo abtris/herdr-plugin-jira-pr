@@ -37,6 +37,7 @@ for arg in "$@"; do
 done
 key="${url##*/issue/}"
 key="${key%%\?*}"
+printf 'curl %s\n' "$url" >>"${STUB_CALLS:-/dev/null}"
 if [ "${STUB_JIRA_DOWN:-0}" = "1" ]; then
   printf '\n000'
   exit 0
@@ -137,7 +138,7 @@ menu_case() {
     STUB_HERDR_LOG="$log" \
     STUB_JIRA_DIR="$work/jira" \
     STUB_PR_JSON="$pr_json" \
-    STUB_CALLS="$state.gh" \
+    STUB_CALLS="$state.calls" \
     HERDR_BIN_PATH="$stub_bin/herdr" \
     HERDR_PANE_ID="w1:p1" \
     HERDR_PLUGIN_CONFIG_DIR="$config_dir" \
@@ -152,7 +153,7 @@ menu_case() {
   got=$(cat "$log")
   pin=$(cat "$state/pins/$(printf "%s|%s" "$toplevel" "$branch" | shasum | cut -d' ' -f1)" \
     2>/dev/null || true)
-  gh_calls=$(wc -l <"$state.gh" 2>/dev/null | tr -d ' ' || echo 0)
+  gh_calls=$(grep -c "^gh " "$state.calls" 2>/dev/null || echo 0)
   if [ "$got" = "$want_report" ] && [ "$pin" = "$want_pin" ] &&
     { [ -z "$want_gh" ] || [ "$gh_calls" = "$want_gh" ]; }; then
     pass "$name"
@@ -301,6 +302,40 @@ run_case "a hanging token command is bounded, not waited on" \
   '[{"number":58,"title":"KR-1234 Fix retry loop","body":""}]' \
   "$prefix --token jira=#58 KR-1234 · jira? --ttl-ms 900000 --token jira_key=KR-1234 --ttl-ms 900000" \
   0 "" "$hang_config"
+
+# With no token configured, nothing should reach Jira at all: keys still show, just
+# without a summary or status. This is the fast path, and the mismatch warning has
+# to survive it, because the project prefixes are what make keys trustworthy.
+nojira_config="$work/config-nojira"
+mkdir -p "$nojira_config"
+cat >"$nojira_config/config.env" <<EOF
+JIRA_URL=http://jira.test
+GH_ACCOUNTS=
+EOF
+
+run_case "without a token the key shows bare" \
+  "feat/kr-1234-retry" \
+  '[{"number":45,"title":"KR-1234 Fix retry loop","body":""}]' \
+  "$prefix --token jira=#45 KR-1234 --ttl-ms 900000 --token jira_key=KR-1234 --ttl-ms 900000" \
+  0 "" "$nojira_config"
+
+run_case "without a token the mismatch is still caught" \
+  "feat/kr-1234-retry" \
+  '[{"number":45,"title":"KR-1240 something else","body":""}]' \
+  "$prefix --token jira=⚠ #45 KR-1234 (branch) ≠ KR-1240 (PR) --ttl-ms 900000 --token jira_key=KR-1234 --ttl-ms 900000" \
+  0 "" "$nojira_config"
+
+run_case "without a token a dropped ticket is still caught" \
+  "lprskavec/KR-1234-retry" \
+  '[{"number":55,"title":"fix(api): handle the retry","body":""}]' \
+  "$prefix --token jira=⚠ #55 KR-1234 not in PR title --ttl-ms 900000 --token jira_key=KR-1234 --ttl-ms 900000" \
+  0 "" "$nojira_config"
+
+run_case "without a token a testbed name is still not a ticket" \
+  "triage/2026-08-04-reservation" \
+  '[{"number":7,"title":"Triaged the dev kr-dev-44 reservation 400","body":""}]' \
+  "$prefix --token jira=#7 --ttl-ms 900000 --clear-token jira_key" \
+  0 "" "$nojira_config"
 
 ESC='\033'
 ENTER='\n'

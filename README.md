@@ -116,9 +116,37 @@ herdr pane get "$HERDR_PANE_ID" | jq -r '.result.tokens.jira_key // empty'
 there is no ticket. Only a key Jira confirms is published, so a typo in a branch
 name never reaches an agent this way.
 
+## Jira is optional
+
+Reading Jira buys three things: the issue summary, its status, and confirmation
+that a key is real. It costs a request, plus around a second when the token comes
+from a secret manager. With no token configured, none of that happens and the line
+is just the ticket:
+
+```
+  #3346 KR-14644                                    no token
+  #3346 KR-14644 Legacy SaaS backfilling · In Progress   with a token
+```
+
+Both warnings survive without Jira, because the project prefixes in
+`JIRA_PROJECTS` are what make a key trustworthy, not the lookup. What you give up
+is the summary, the status, and `⚠ KR-9999 not in Jira` for a mistyped key.
+Measured on one machine, a cold resolve runs about 1.0s without lookups and 1.8s
+with them, against 2.9s before the token was cached.
+
+`JIRA_LOOKUP=off` skips lookups even when a token is configured. The popup's `j`
+still opens the issue in a browser either way, since that only needs `JIRA_URL`.
+
+When the token comes from `JIRA_API_TOKEN_CMD`, it is cached for
+`TOKEN_CACHE_TTL` seconds (8 hours by default) in a `0600` file under the state
+dir. Without that cache every plugin invocation re-runs the command, and a
+password manager asks for approval each time. Set `TOKEN_CACHE_TTL=0` to keep the
+token out of the filesystem and live with the prompts.
+
 ## Requirements
 
-`git`, `gh` (authenticated), `jq`, `curl`, and Herdr 0.8.0 or newer.
+`git`, `gh` (authenticated), `jq`, and Herdr 0.8.0 or newer. `curl` too, unless you
+run without Jira lookups.
 
 ## Install
 
