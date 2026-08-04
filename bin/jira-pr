@@ -27,6 +27,8 @@ JIRA_AUTH="${JIRA_AUTH:-bearer}"
 JIRA_LOGIN="${JIRA_LOGIN:-}"
 JIRA_API_TOKEN="${JIRA_API_TOKEN:-}"
 JIRA_API_TOKEN_CMD="${JIRA_API_TOKEN_CMD:-}"
+JIRA_LOOKUP="${JIRA_LOOKUP:-auto}"
+TOKEN_CACHE_TTL="${TOKEN_CACHE_TTL:-28800}"
 TOKEN_CMD_TIMEOUT="${TOKEN_CMD_TIMEOUT:-10}"
 GH_ACCOUNTS="${GH_ACCOUNTS-ladislav@prskavec.net=abtris;lprskavec@purestorage.com=lprskavec_pure}"
 OPEN_CMD="${OPEN_CMD:-}"
@@ -105,14 +107,66 @@ jira_token() {
   fi
 }
 
+# Reading Jira costs a request plus, when the token lives in a secret manager, a
+# second to fetch it. That buys the summary and status, and confirmation that a key
+# is real. Without it the sidebar still shows the ticket and still catches a branch
+# and PR naming different ones, because the project prefixes do that work. So the
+# lookup is optional: no token configured means no Jira traffic at all.
+jira_lookup_enabled() {
+  [ "$JIRA_LOOKUP" != "off" ] || return 1
+  [ -n "$JIRA_URL" ] || return 1
+  [ -n "$JIRA_API_TOKEN" ] || [ -n "$JIRA_API_TOKEN_CMD" ] || return 1
+}
+
 # Resolves the token into JIRA_API_TOKEN in the *current* process, so the nested
 # command substitutions that follow inherit it instead of each paying for the
 # secret manager again. Reaching 1Password costs about a second, and the mismatch
 # check alone looks up two or three issues.
 ensure_token() {
-  if [ -z "$JIRA_API_TOKEN" ] && [ -n "$JIRA_API_TOKEN_CMD" ]; then
-    JIRA_API_TOKEN=$(jira_token)
+  jira_lookup_enabled || return 0
+  if [ -n "$JIRA_API_TOKEN" ] || [ -z "$JIRA_API_TOKEN_CMD" ]; then
+    return 0
   fi
+  JIRA_API_TOKEN=$(read_token_cache)
+  if [ -n "$JIRA_API_TOKEN" ]; then
+    return 0
+  fi
+  JIRA_API_TOKEN=$(jira_token)
+  if [ -n "$JIRA_API_TOKEN" ]; then
+    write_token_cache "$JIRA_API_TOKEN"
+  fi
+}
+
+# A secret manager authorises per calling process, so every plugin invocation
+# prompts. Caching the token avoids that, at the cost of holding it in a 0600 file
+# under the plugin state dir for TOKEN_CACHE_TTL seconds. Set that to 0 to keep the
+# token out of the filesystem and accept the prompts.
+token_cache_file() {
+  printf '%s/token' "$STATE_DIR"
+}
+
+read_token_cache() {
+  local file age
+  [ "$TOKEN_CACHE_TTL" -gt 0 ] 2>/dev/null || return 0
+  file=$(token_cache_file)
+  [ -f "$file" ] || return 0
+  age=$(($(date +%s) - $(file_mtime "$file")))
+  if [ "$age" -lt "$TOKEN_CACHE_TTL" ]; then
+    cat "$file"
+  else
+    rm -f "$file"
+  fi
+}
+
+write_token_cache() {
+  local file
+  [ "$TOKEN_CACHE_TTL" -gt 0 ] 2>/dev/null || return 0
+  file=$(token_cache_file)
+  mkdir -p "$STATE_DIR"
+  (
+    umask 077
+    printf '%s' "$1" >"$file.tmp"
+  ) && mv "$file.tmp" "$file"
 }
 
 # --- pane and repo discovery -------------------------------------------------
@@ -258,6 +312,9 @@ jira_issue() {
 }
 
 jira_issue_exists() {
+  # With lookups off, a key that matches the project prefixes is taken at face
+  # value. That is what keeps the mismatch warning working without Jira.
+  jira_lookup_enabled || return 0
   jira_issue "$1" >/dev/null 2>&1
 }
 
@@ -300,6 +357,21 @@ trim_summary() {
   fi
 }
 
+# "KR-1234 Fix retry loop · In Review" with Jira, plain "KR-1234" without it. The
+# separators only appear when there is something on both sides of them.
+ticket_label() {
+  local key="$1" summary="$2" status="$3"
+  local out="$key" trimmed
+  trimmed=$(trim_summary "$summary")
+  if [ -n "$trimmed" ]; then
+    out="$out $trimmed"
+  fi
+  if [ -n "$status" ]; then
+    out="$out · $status"
+  fi
+  printf '%s' "$out"
+}
+
 # --- resolution --------------------------------------------------------------
 
 # Reads candidate "key<SEP>origin" lines on stdin and prints the first key Jira
@@ -310,6 +382,14 @@ first_real_issue() {
   while IFS="$SEP" read -r key origin; do
     [ -n "$key" ] || continue
     saw=1
+    # With lookups off, the first candidate wins with no summary or status. The
+    # prefix allowlist is the only filter, which is why a testbed like kr-dev-44
+    # still cannot reach the sidebar.
+    if ! jira_lookup_enabled; then
+      join_rec "$key" "" "" "$origin"
+      printf '\n'
+      return 0
+    fi
     details=$(jira_issue "$key") && rc=0 || rc=$?
     if [ "$rc" -eq 0 ]; then
       join_rec "$key" "$details" "$origin"; printf '\n'
@@ -364,14 +444,12 @@ compose() {
     # agent is supposed to be working on before it opens anything.
     if [ -n "$pin" ]; then
       ensure_token
-    fi
-    if [ -n "$pin" ] && resolved=$(jira_issue "$pin"); then
-      IFS="$SEP" read -r summary issue_status <<<"$resolved"
-      line="$pin $(trim_summary "$summary")"
-      if [ -n "$issue_status" ]; then
-        line="$line · $issue_status"
+      summary=""
+      issue_status=""
+      if jira_lookup_enabled && resolved=$(jira_issue "$pin"); then
+        IFS="$SEP" read -r summary issue_status <<<"$resolved"
       fi
-      join_rec "$line" "" "$pin"
+      join_rec "$(ticket_label "$pin" "$summary" "$issue_status")" "" "$pin"
     fi
     return 0
   fi
@@ -428,10 +506,7 @@ compose() {
       fi
 
       if [ -z "$line" ]; then
-        line="#$number $key $(trim_summary "$summary")"
-        if [ -n "$issue_status" ]; then
-          line="$line · $issue_status"
-        fi
+        line="#$number $(ticket_label "$key" "$summary" "$issue_status")"
       fi
       join_rec "$line" "$url" "$key"
       ;;
@@ -675,7 +750,9 @@ menu_assign() {
   fi
   # Confirm it exists before pinning, so a typo does not become the answer. With
   # no token there is nothing to check against, so accept it.
-  if [ -n "$(jira_token)" ] && ! jira_issue_exists "$entry"; then
+  # Checking through jira_lookup_enabled rather than the token keeps this from
+  # reaching the secret manager just to decide whether to validate.
+  if jira_lookup_enabled && ! jira_issue_exists "$entry"; then
     pause_message "$entry is not in Jira."
     return 1
   fi
@@ -757,7 +834,35 @@ cmd_doctor() {
   printf 'sidebar token $%s\n' "$TOKEN_NAME"
   printf 'jira url      %s\n' "${JIRA_URL:-(unset)}"
   printf 'jira auth     %s\n' "$JIRA_AUTH"
-  local token code who
+  printf 'bash          %s\n' "${BASH_VERSION:-unknown}"
+  local token code who cache
+  if ! jira_lookup_enabled; then
+    if [ "$JIRA_LOOKUP" = "off" ]; then
+      printf 'jira lookups  off by JIRA_LOOKUP, showing keys without summaries\n'
+    else
+      printf 'jira lookups  off, no token configured. Keys still show, without\n'
+      printf '              summary or status, and nothing calls Jira.\n'
+    fi
+    for tool in git gh jq; do
+      if command -v "$tool" >/dev/null 2>&1; then
+        printf '%-13s %s\n' "$tool" "$(command -v "$tool")"
+      else
+        printf '%-13s MISSING\n' "$tool"
+      fi
+    done
+    return 0
+  fi
+  cache=$(token_cache_file)
+  if [ "$TOKEN_CACHE_TTL" -gt 0 ] 2>/dev/null; then
+    if [ -f "$cache" ]; then
+      printf 'token cache   %s, %ss old, TTL %ss\n' "$cache" \
+        "$(($(date +%s) - $(file_mtime "$cache")))" "$TOKEN_CACHE_TTL"
+    else
+      printf 'token cache   %s, empty, TTL %ss\n' "$cache" "$TOKEN_CACHE_TTL"
+    fi
+  else
+    printf 'token cache   disabled\n'
+  fi
   token=$(jira_token)
   if [ -n "$token" ]; then
     if [ -n "$JIRA_API_TOKEN_CMD" ]; then
