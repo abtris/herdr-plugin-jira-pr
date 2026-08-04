@@ -134,7 +134,7 @@ run_case "key only in the PR title" \
 run_case "a key merely mentioned in the body does not count" \
   "tidy-things" \
   '[{"number":49,"title":"tidy up the config","body":"the row looks like #45 KR-1234 Fix the retry loop"}]' \
-  "$prefix --token jira=⚠ #49 no Jira key --ttl-ms 900000"
+  "$prefix --token jira=#49 --ttl-ms 900000"
 
 run_case "a key behind a linking word in the body counts" \
   "tidy-things" \
@@ -151,27 +151,39 @@ run_case "KRI incident keys are recognized, not read as KR" \
   '[{"number":52,"title":"KRI-77 triage the cluster incident","body":""}]' \
   "$prefix --token jira=#52 KRI-77 Cluster incident triage · Open --ttl-ms 900000"
 
-# The triage branch also covers the no-warning path: kr-dev-44 is a testbed, and
-# triage work carries no ticket by design, so neither should produce a warning.
-run_case "a testbed name is not a ticket key, and triage is not warned about" \
+# The assignment lives in the branch name, per the team convention that a branch
+# is $USER/KR-XXXXX-name and the PR title must repeat the ticket. A ticket that
+# never reached the title is the case worth seeing.
+run_case "a branch ticket missing from the PR title is flagged" \
+  "lprskavec/KR-1234-retry" \
+  '[{"number":55,"title":"fix(api): handle the retry","body":"no ticket here"}]' \
+  "$prefix --token jira=⚠ #55 KR-1234 not in PR title --ttl-ms 900000"
+
+run_case "a branch ticket repeated in the PR title is fine" \
+  "lprskavec/KR-1234-retry" \
+  '[{"number":56,"title":"fix(api): KR-1234 handle the retry","body":""}]' \
+  "$prefix --token jira=#56 KR-1234 Fix retry loop · In Review --ttl-ms 900000"
+
+# kr-dev-44 is a testbed, and triage work carries no ticket by design.
+run_case "a testbed name is not a ticket key, and triage is not nagged" \
   "triage/2026-08-04-reservation" \
   '[{"number":7,"title":"Triaged the dev kr-dev-44 reservation 400","body":"kr-dev-44 returned 400"}]' \
   "$prefix --token jira=#7 --ttl-ms 900000"
 
-run_case "a feature branch with no ticket is still warned about" \
-  "feat/add-retry" \
-  '[{"number":54,"title":"add a retry","body":"no ticket for this"}]' \
-  "$prefix --token jira=⚠ #54 no Jira key --ttl-ms 900000"
+run_case "a chore branch with no ticket is fine" \
+  "chore/bump-deps" \
+  '[{"number":54,"title":"chore: bump deps","body":"no ticket for this"}]' \
+  "$prefix --token jira=#54 --ttl-ms 900000"
 
 run_case "a branch that only looks like a key is ignored" \
   "fix/retry-2" \
   '[{"number":53,"title":"retry twice before giving up","body":""}]' \
-  "$prefix --token jira=⚠ #53 no Jira key --ttl-ms 900000"
+  "$prefix --token jira=#53 --ttl-ms 900000"
 
 run_case "no Jira key anywhere" \
   "tidy-things" \
   '[{"number":47,"title":"tidy up the config","body":"no ticket"}]' \
-  "$prefix --token jira=⚠ #47 no Jira key --ttl-ms 900000"
+  "$prefix --token jira=#47 --ttl-ms 900000"
 
 run_case "key that does not exist in Jira" \
   "feat/kr-9999-ghost" \

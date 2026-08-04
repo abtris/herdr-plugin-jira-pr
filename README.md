@@ -1,8 +1,8 @@
 # herdr-plugin-jira-pr
 
 A [Herdr](https://herdr.dev) plugin that shows the Jira issue behind the current
-branch's pull request, and warns when the branch and the PR point at different
-issues.
+branch's pull request, so you can see whether an agent carried the ticket you
+assigned it into the PR it opened.
 
 The line appears under the agent in the Agents sidebar:
 
@@ -21,30 +21,34 @@ ends up linked to the wrong issue — you get this instead:
   krypton-kag · shell
 ```
 
-Other states: `⚠ #47 no Jira key` when the PR mentions no ticket at all,
-`⚠ #48 KR-9999 not in Jira` when the key is a typo, and `#45 KR-1234 · jira?`
-when Jira could not be reached. With no PR for the branch, the line disappears.
+The other warning is a ticket that never left the branch name, `⚠ #55 KR-1234 not
+in PR title`. That is the assignment going missing: you hand an agent a ticket by
+branching from it, and the PR is where the ticket has to reappear.
 
-Branches matching `NO_TICKET_BRANCHES` (`^(triage|docs|chore)/` by default) show
-the PR number alone, since triage and docs work carries no ticket by design and a
-warning there is a warning about nothing.
+Remaining states: `⚠ #48 KR-9999 not in Jira` when the key is a typo, and
+`#45 KR-1234 · jira?` when Jira could not be reached. A PR with no ticket
+anywhere shows `#47` on its own — chore work, triage, and repos that do not use
+Jira are all normal, and nagging about them trains you to ignore the line. With
+no PR for the branch at all, the line disappears.
 
 ## How it decides
 
-Candidate issue keys come from the branch name, the PR title, and the PR body,
-in that order. The plugin looks each candidate up in Jira and takes the first one
-that exists.
+The branch name carries the assignment, the PR title is where it has to end up.
+That mirrors a common convention — branch `$USER/KR-XXXXX-name`, PR title
+`type(scope): KR-XXXXX description` — so candidate keys are read from the branch
+name, then the PR title, then the PR body, and each is looked up in Jira until one
+exists.
 
 Two filters keep noise out of the sidebar. Keys must carry one of the project
 prefixes in `JIRA_PROJECTS` (`KR,KRI` by default), so a branch called
-`fix/retry-2` never looks like a ticket. And a key in the PR body counts only
-inside a Jira link or behind a linking word such as `fixes` or `resolves` —
-bodies mention tickets in passing far too often for a bare key to mean "this is
-the issue".
+`fix/retry-2` never looks like a ticket, and neither does a testbed named
+`kr-dev-44`. And a key in the PR body counts only inside a Jira link or behind a
+linking word such as `fixes` or `resolves` — bodies mention tickets in passing far
+too often for a bare key to mean "this is the issue".
 
-The mismatch warning fires only when the branch and the PR each name a
-*different issue that exists*. One side being silent is normal and not worth a
-warning.
+Both warnings need a real issue to fire. The mismatch needs the branch and the PR
+each naming a *different* issue that exists in Jira; the missing-from-title
+warning needs the branch's ticket to exist. Silence on one side is normal.
 
 ## Requirements
 
