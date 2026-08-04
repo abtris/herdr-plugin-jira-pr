@@ -25,6 +25,10 @@ Other states: `⚠ #47 no Jira key` when the PR mentions no ticket at all,
 `⚠ #48 KR-9999 not in Jira` when the key is a typo, and `#45 KR-1234 · jira?`
 when Jira could not be reached. With no PR for the branch, the line disappears.
 
+Branches matching `NO_TICKET_BRANCHES` (`^(triage|docs|chore)/` by default) show
+the PR number alone, since triage and docs work carries no ticket by design and a
+warning there is a warning about nothing.
+
 ## How it decides
 
 Candidate issue keys come from the branch name, the PR title, and the PR body,
