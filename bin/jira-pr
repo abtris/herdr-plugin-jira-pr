@@ -3,7 +3,10 @@
 # metadata, and flag when the branch and the PR point at different issues.
 set -euo pipefail
 
-TAB=$'\t'
+# Internal records use the unit separator, not a tab: tab counts as IFS
+# whitespace, so bash collapses runs of it and an empty middle field silently
+# shifts every field after it.
+SEP=$'\037'
 HERDR="${HERDR_BIN_PATH:-herdr}"
 SOURCE_ID="abtris.jira-pr"
 CONFIG_DIR="${HERDR_PLUGIN_CONFIG_DIR:-$HOME/.config/herdr/plugins/$SOURCE_ID}"
@@ -23,6 +26,7 @@ JIRA_API_TOKEN="${JIRA_API_TOKEN:-}"
 JIRA_API_TOKEN_CMD=""
 TOKEN_CMD_TIMEOUT=10
 GH_ACCOUNTS="ladislav@prskavec.net=abtris;lprskavec@purestorage.com=lprskavec_pure"
+OPEN_CMD=""
 
 if [ -f "$CONFIG_DIR/config.env" ]; then
   set -a
@@ -55,6 +59,20 @@ if [ -z "$KEY_PATTERN" ]; then
     KEY_PATTERN='[A-Za-z][A-Za-z0-9]+-[0-9]+'
   fi
 fi
+
+# Joins its arguments into one SEP-delimited record. Preserves empty fields,
+# which is the whole reason records do not use tabs.
+join_rec() {
+  local first=1 field
+  for field in "$@"; do
+    if [ "$first" -eq 1 ]; then
+      first=0
+    else
+      printf '%s' "$SEP"
+    fi
+    printf '%s' "$field"
+  done
+}
 
 file_mtime() {
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
@@ -158,15 +176,15 @@ gh_pr_list() {
   if [ -n "$token" ]; then
     GH_TOKEN="$token" GH_PAGER="cat" gh pr list \
       --repo "$slug" --head "$branch" --state "$state" --limit 1 \
-      --json number,title,body 2>/dev/null || true
+      --json number,title,body,url 2>/dev/null || true
   else
     GH_PAGER="cat" gh pr list \
       --repo "$slug" --head "$branch" --state "$state" --limit 1 \
-      --json number,title,body 2>/dev/null || true
+      --json number,title,body,url 2>/dev/null || true
   fi
 }
 
-# Prints the PR for this branch as "number<TAB>title<TAB>body", or nothing.
+# Prints the PR as "number<SEP>title<SEP>body<SEP>url", or nothing.
 find_pr() {
   local repo_root="$1" branch="$2" slug token state raw parsed
   slug=$(repo_slug "$repo_root")
@@ -175,7 +193,9 @@ find_pr() {
   for state in open all; do
     raw=$(gh_pr_list "$slug" "$branch" "$state" "$token")
     parsed=$(printf '%s' "$raw" |
-      jq -r '.[0] | select(.) | [.number, .title, ((.body // "") | gsub("[\r\n\t]+"; " "))] | @tsv' \
+      jq -r '.[0] | select(.) |
+        [(.number | tostring), (.title | gsub("[\r\n\t]+"; " ")),
+         ((.body // "") | gsub("[\r\n\t]+"; " ")), (.url // "")] | join("\u001f")' \
         2>/dev/null || true)
     if [ -n "$parsed" ]; then
       printf '%s' "$parsed"
@@ -186,7 +206,7 @@ find_pr() {
 
 # --- Jira --------------------------------------------------------------------
 
-# Prints "summary<TAB>status". Exit 3 = no such issue, 4 = Jira could not be
+# Prints "summary<SEP>status". Exit 3 = no such issue, 4 = Jira could not be
 # consulted at all (missing token, network, auth).
 # Populates JIRA_AUTH_ARGS for curl. Bearer is the personal access token form used
 # by Jira Data Center; basic pairs JIRA_LOGIN with the token, as Jira Cloud wants.
@@ -220,7 +240,8 @@ jira_issue() {
     *) return 4 ;;
   esac
   printf '%s' "$body" |
-    jq -r '[(.fields.summary // ""), (.fields.status.name // "")] | @tsv' 2>/dev/null || return 4
+    jq -r '[((.fields.summary // "") | gsub("[\r\n\t]+"; " ")),
+            (.fields.status.name // "")] | join("\u001f")' 2>/dev/null || return 4
 }
 
 jira_issue_exists() {
@@ -268,17 +289,17 @@ trim_summary() {
 
 # --- resolution --------------------------------------------------------------
 
-# Reads candidate "key<TAB>origin" lines on stdin and prints the first key Jira
-# confirms as "key<TAB>summary<TAB>status<TAB>origin". Exit 3 = candidates
+# Reads candidate "key<SEP>origin" lines on stdin and prints the first key Jira
+# confirms as "key<SEP>summary<SEP>status<SEP>origin". Exit 3 = candidates
 # existed but none resolved, 4 = Jira unreachable, 1 = no candidates.
 first_real_issue() {
   local key origin details rc saw=0 unreachable=0
-  while IFS="$TAB" read -r key origin; do
+  while IFS="$SEP" read -r key origin; do
     [ -n "$key" ] || continue
     saw=1
     details=$(jira_issue "$key") && rc=0 || rc=$?
     if [ "$rc" -eq 0 ]; then
-      printf '%s\t%s\t%s\n' "$key" "$details" "$origin"
+      join_rec "$key" "$details" "$origin"; printf '\n'
       return 0
     fi
     if [ "$rc" -eq 4 ]; then
@@ -296,95 +317,174 @@ first_real_issue() {
 
 # Prints the first key from the candidate list, for the failure messages.
 first_key() {
-  printf '%s' "$1" | head -1 | cut -d"$TAB" -f1
+  printf '%s' "$1" | head -1 | cut -d"$SEP" -f1
 }
 
+branch_slug() {
+  printf '%s|%s' "$1" "$2" | shasum | cut -d' ' -f1
+}
+
+# A ticket pinned through the popup, for work whose branch name does not carry
+# one. It outranks the branch as the statement of what was assigned.
+pin_file() {
+  printf '%s/pins/%s' "$STATE_DIR" "$(branch_slug "$1" "$2")"
+}
+
+read_pin() {
+  local file
+  file=$(pin_file "$1" "$2")
+  [ -f "$file" ] && cat "$file" || true
+}
+
+# Prints "line<SEP>pr_url<SEP>key", where line is what the sidebar shows. An
+# empty result means there is nothing to say and the row should disappear.
 compose() {
   local repo_root="$1" branch="$2"
-  local pr number title body branch_keys title_keys body_keys candidates key
-  local resolved status summary issue_status origin key2
+  local pr number title body url pin branch_keys title_keys body_keys candidates key
+  local resolved status summary issue_status origin key2 assigned line=""
 
+  pin=$(read_pin "$repo_root" "$branch")
   pr=$(find_pr "$repo_root" "$branch")
-  # No PR for this branch: report nothing, so the sidebar row disappears.
-  [ -n "$pr" ] || return 0
-  IFS="$TAB" read -r number title body <<<"$pr"
+
+  if [ -z "$pr" ]; then
+    # No PR yet. A pinned ticket is still worth showing, so you can see what the
+    # agent is supposed to be working on before it opens anything.
+    if [ -n "$pin" ] && resolved=$(jira_issue "$pin"); then
+      IFS="$SEP" read -r summary issue_status <<<"$resolved"
+      line="$pin $(trim_summary "$summary")"
+      if [ -n "$issue_status" ]; then
+        line="$line · $issue_status"
+      fi
+      join_rec "$line" "" "$pin"
+    fi
+    return 0
+  fi
+
+  IFS="$SEP" read -r number title body url <<<"$pr"
 
   branch_keys=$(extract_keys "$branch")
   title_keys=$(extract_keys "$title")
   body_keys=$(extract_linked_keys "${body:-}")
 
   candidates=""
-  for key in $branch_keys; do candidates+="$key${TAB}branch"$'\n'; done
-  for key in $title_keys; do candidates+="$key${TAB}PR title"$'\n'; done
-  for key in $body_keys; do candidates+="$key${TAB}PR body"$'\n'; done
+  if [ -n "$pin" ]; then candidates+="$pin${SEP}assigned"$'\n'; fi
+  for key in $branch_keys; do candidates+="$key${SEP}branch"$'\n'; done
+  for key in $title_keys; do candidates+="$key${SEP}PR title"$'\n'; done
+  for key in $body_keys; do candidates+="$key${SEP}PR body"$'\n'; done
 
   resolved=$(printf '%s' "$candidates" | first_real_issue) && status=0 || status=$?
 
   case "$status" in
     0)
-      IFS="$TAB" read -r key summary issue_status origin <<<"$resolved"
+      IFS="$SEP" read -r key summary issue_status origin <<<"$resolved"
+      assigned=0
+      case "$origin" in
+        assigned | branch) assigned=1 ;;
+      esac
 
-      # The point of the plugin: if the branch and the PR text each name a real
-      # but different issue, the PR is probably linked to the wrong ticket.
-      if [ "$origin" = "branch" ]; then
+      if [ "$assigned" -eq 1 ]; then
+        # The assignment says one ticket and the PR says another: the usual way a
+        # PR ends up linked to the wrong issue.
         for key2 in $title_keys $body_keys; do
           if [ "$key2" != "$key" ] && jira_issue_exists "$key2"; then
-            printf '⚠ #%s %s (branch) ≠ %s (PR)' "$number" "$key" "$key2"
-            return 0
+            line="⚠ #$number $key ($origin) ≠ $key2 (PR)"
+            break
           fi
         done
-        # The branch carries the assignment, and the PR title is where it has to
-        # end up. A ticket that never made it out of the branch name is the
-        # agent quietly dropping it.
-        if ! list_contains "$key" "$title_keys"; then
-          printf '⚠ #%s %s not in PR title' "$number" "$key"
-          return 0
+        # The assignment has to reappear in the PR title. A ticket that never got
+        # that far is the agent quietly dropping it.
+        if [ -z "$line" ] && ! list_contains "$key" "$title_keys"; then
+          line="⚠ #$number $key not in PR title"
         fi
       else
         for key2 in $branch_keys; do
           if [ "$key2" != "$key" ] && jira_issue_exists "$key2"; then
-            printf '⚠ #%s %s (branch) ≠ %s (PR)' "$number" "$key2" "$key"
-            return 0
+            line="⚠ #$number $key2 (branch) ≠ $key (PR)"
+            break
           fi
         done
       fi
 
-      printf '#%s %s %s' "$number" "$key" "$(trim_summary "$summary")"
-      if [ -n "$issue_status" ]; then
-        printf ' · %s' "$issue_status"
+      if [ -z "$line" ]; then
+        line="#$number $key $(trim_summary "$summary")"
+        if [ -n "$issue_status" ]; then
+          line="$line · $issue_status"
+        fi
       fi
+      join_rec "$line" "$url" "$key"
       ;;
-    3) printf '⚠ #%s %s not in Jira' "$number" "$(first_key "$candidates")" ;;
+    3)
+      key=$(first_key "$candidates")
+      join_rec "⚠ #$number $key not in Jira" "$url" ""
+      ;;
     4)
       key=$(first_key "$candidates")
       if [ -n "$key" ]; then
-        printf '#%s %s · jira?' "$number" "$key"
+        join_rec "#$number $key · jira?" "$url" "$key"
       else
-        printf '#%s' "$number"
+        join_rec "#$number" "$url" ""
       fi
       ;;
     # No ticket anywhere is normal: chore work, triage, and repos that do not
     # use Jira at all. Show the PR alone rather than nagging.
-    *) printf '#%s' "$number" ;;
+    *) join_rec "#$number" "$url" "" ;;
   esac
 }
 
+# Reports the display line as $jira and the resolved key as $jira_key. The key is
+# there so an agent in this pane can read its own assigned ticket back out of
+# `herdr pane get` and use it when it names a branch or writes a PR title.
 report() {
-  local target="$1" value="$2"
-  if [ -n "$value" ]; then
-    "$HERDR" pane report-metadata "$target" \
-      --source "$SOURCE_ID" \
-      --token "$TOKEN_NAME=$value" \
-      --ttl-ms "$TOKEN_TTL_MS" >/dev/null
+  local target="$1" line="$2" key="$3"
+  local -a args=(pane report-metadata "$target" --source "$SOURCE_ID")
+  if [ -n "$line" ]; then
+    args+=(--token "$TOKEN_NAME=$line" --ttl-ms "$TOKEN_TTL_MS")
   else
-    "$HERDR" pane report-metadata "$target" \
-      --source "$SOURCE_ID" \
-      --clear-token "$TOKEN_NAME" >/dev/null
+    args+=(--clear-token "$TOKEN_NAME")
   fi
+  if [ -n "$key" ]; then
+    args+=(--token "${TOKEN_NAME}_key=$key" --ttl-ms "$TOKEN_TTL_MS")
+  else
+    args+=(--clear-token "${TOKEN_NAME}_key")
+  fi
+  "$HERDR" "${args[@]}" >/dev/null
+}
+
+# Prints "repo_root<SEP>branch" for the pane Herdr invoked us for, or nothing.
+pane_repo() {
+  local target="$1" cwd repo_root branch
+  cwd=$(pane_cwd "$target")
+  { [ -n "$cwd" ] && [ -d "$cwd" ]; } || return 0
+  repo_root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
+  [ -n "$repo_root" ] || return 0
+  branch=$(git -C "$repo_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  [ -n "$branch" ] || return 0
+  join_rec "$repo_root" "$branch"
+}
+
+# compose() through the cache, so the frequent events stay cheap.
+resolve() {
+  local repo_root="$1" branch="$2" force="${3:-0}" cache age value
+  mkdir -p "$STATE_DIR/cache"
+  cache="$STATE_DIR/cache/$(branch_slug "$repo_root" "$branch")"
+  if [ "$force" -eq 0 ] && [ -f "$cache" ]; then
+    age=$(($(date +%s) - $(file_mtime "$cache")))
+    if [ "$age" -lt "$CACHE_TTL" ]; then
+      cat "$cache"
+      return 0
+    fi
+  fi
+  value=$(compose "$repo_root" "$branch")
+  printf '%s' "$value" >"$cache.tmp" && mv "$cache.tmp" "$cache"
+  printf '%s' "$value"
+}
+
+invalidate() {
+  rm -f "$STATE_DIR/cache/$(branch_slug "$1" "$2")"
 }
 
 cmd_refresh() {
-  local force=0 target cwd repo_root branch slug cache age value
+  local force=0 target repo branch repo_root value line key
   if [ "${1:-}" = "--force" ]; then
     force=1
   fi
@@ -392,34 +492,123 @@ cmd_refresh() {
   target=$(pane_id)
   [ -n "$target" ] || exit 0
 
-  cwd=$(pane_cwd "$target")
-  { [ -n "$cwd" ] && [ -d "$cwd" ]; } || exit 0
-
-  repo_root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
-  branch=""
-  if [ -n "$repo_root" ]; then
-    branch=$(git -C "$repo_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-  fi
-  if [ -z "$branch" ]; then
-    report "$target" ""
+  repo=$(pane_repo "$target")
+  if [ -z "$repo" ]; then
+    report "$target" "" ""
     exit 0
   fi
+  IFS="$SEP" read -r repo_root branch <<<"$repo"
 
-  mkdir -p "$STATE_DIR/cache"
-  slug=$(printf '%s|%s' "$repo_root" "$branch" | shasum | cut -d' ' -f1)
-  cache="$STATE_DIR/cache/$slug"
+  value=$(resolve "$repo_root" "$branch" "$force")
+  IFS="$SEP" read -r line _ key <<<"$value"
+  report "$target" "$line" "$key"
+}
 
-  if [ "$force" -eq 0 ] && [ -f "$cache" ]; then
-    age=$(( $(date +%s) - $(file_mtime "$cache") ))
-    if [ "$age" -lt "$CACHE_TTL" ]; then
-      report "$target" "$(cat "$cache")"
-      exit 0
-    fi
+# Prints the ticket for the current pane's branch, for agents and scripts.
+cmd_ticket() {
+  local target repo repo_root branch value key
+  target=$(pane_id)
+  repo=$(pane_repo "$target")
+  [ -n "$repo" ] || return 1
+  IFS="$SEP" read -r repo_root branch <<<"$repo"
+  value=$(resolve "$repo_root" "$branch")
+  IFS="$SEP" read -r _ _ key <<<"$value"
+  [ -n "$key" ] || return 1
+  printf '%s\n' "$key"
+}
+
+open_url() {
+  local url="$1" opener
+  [ -n "$url" ] || return 0
+  if [ -n "$OPEN_CMD" ]; then
+    opener="$OPEN_CMD"
+  elif command -v open >/dev/null 2>&1; then
+    opener="open"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    opener="xdg-open"
+  else
+    return 1
   fi
+  "$opener" "$url" >/dev/null 2>&1 || return 1
+}
 
-  value=$(compose "$repo_root" "$branch")
-  printf '%s' "$value" >"$cache.tmp" && mv "$cache.tmp" "$cache"
-  report "$target" "$value"
+# --- popup -------------------------------------------------------------------
+
+# Herdr gives a popup entrypoint a real terminal, so this draws its own frame and
+# reads one keystroke. Popups get no HERDR_PANE_ID; the underlying pane arrives
+# through HERDR_PLUGIN_CONTEXT_JSON, which pane_id and pane_cwd already handle.
+menu_row() {
+  printf '  %s  %s\n' "$1" "$2"
+}
+
+cmd_menu() {
+  local target repo repo_root branch value line pr_url key choice entry pin
+
+  target=$(pane_id)
+  repo=$(pane_repo "$target")
+  if [ -z "$repo" ]; then
+    printf '\n  Not a git branch in this pane.\n\n  press any key\n'
+    read -rsn1 _ || true
+    return 0
+  fi
+  IFS="$SEP" read -r repo_root branch <<<"$repo"
+
+  value=$(resolve "$repo_root" "$branch")
+  IFS="$SEP" read -r line pr_url key <<<"$value"
+  pin=$(read_pin "$repo_root" "$branch")
+
+  printf '\n  Jira PR — %s\n\n' "$branch"
+  if [ -n "$pr_url" ]; then
+    menu_row p "${line:-open the pull request}"
+  else
+    menu_row ' ' 'no pull request for this branch'
+  fi
+  if [ -n "$key" ]; then
+    menu_row j "$key in Jira"
+  fi
+  menu_row a 'assign a ticket…'
+  if [ -n "$pin" ]; then
+    menu_row c "clear assigned $pin"
+  fi
+  printf '\n  esc  cancel\n'
+
+  read -rsn1 choice || return 0
+  case "$choice" in
+    p) open_url "$pr_url" ;;
+    j) [ -n "$key" ] && open_url "$JIRA_URL/browse/$key" ;;
+    a)
+      printf '\n  ticket: '
+      read -r entry || return 0
+      entry=$(printf '%s' "$entry" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+      if [ -z "$entry" ]; then
+        return 0
+      fi
+      if ! printf '%s' "$entry" | grep -qiE "^$KEY_PATTERN$"; then
+        printf '  %s does not look like a ticket key.\n  press any key\n' "$entry"
+        read -rsn1 _ || true
+        return 0
+      fi
+      # Confirm it exists before pinning, so a typo does not become the answer.
+      if ! jira_issue_exists "$entry" && [ -n "$(jira_token)" ]; then
+        printf '  %s is not in Jira.\n  press any key\n' "$entry"
+        read -rsn1 _ || true
+        return 0
+      fi
+      mkdir -p "$STATE_DIR/pins"
+      printf '%s' "$entry" >"$(pin_file "$repo_root" "$branch")"
+      invalidate "$repo_root" "$branch"
+      value=$(resolve "$repo_root" "$branch")
+      IFS="$SEP" read -r line _ key <<<"$value"
+      report "$target" "$line" "$key"
+      ;;
+    c)
+      rm -f "$(pin_file "$repo_root" "$branch")"
+      invalidate "$repo_root" "$branch"
+      value=$(resolve "$repo_root" "$branch")
+      IFS="$SEP" read -r line _ key <<<"$value"
+      report "$target" "$line" "$key"
+      ;;
+  esac
 }
 
 cmd_doctor() {
@@ -475,9 +664,11 @@ case "${1:-refresh}" in
     shift || true
     cmd_refresh "${1:-}"
     ;;
+  menu) cmd_menu ;;
+  ticket) cmd_ticket ;;
   doctor) cmd_doctor ;;
   *)
-    printf 'usage: jira-pr [refresh [--force]|doctor]\n' >&2
+    printf 'usage: jira-pr [refresh [--force]|menu|ticket|doctor]\n' >&2
     exit 64
     ;;
 esac

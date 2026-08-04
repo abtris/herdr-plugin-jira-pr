@@ -23,6 +23,14 @@ title = "Check Jira/PR plugin setup"
 contexts = ["global"]
 command = ["bash", "bin/jira-pr", "doctor"]
 
+[[panes]]
+id = "menu"
+title = "Jira PR"
+placement = "popup"
+width = 52
+height = 12
+command = ["bash", "bin/jira-pr", "menu"]
+
 [[events]]
 on = "pane.focused"
 command = ["bash", "bin/jira-pr", "refresh"]

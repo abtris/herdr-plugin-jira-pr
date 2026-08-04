@@ -50,6 +50,52 @@ Both warnings need a real issue to fire. The mismatch needs the branch and the P
 each naming a *different* issue that exists in Jira; the missing-from-title
 warning needs the branch's ticket to exist. Silence on one side is normal.
 
+## The popup
+
+Herdr's own right-click menus are not extensible by plugins, so the menu hangs off
+a key instead. Bind one to the `menu` pane entrypoint and it opens a modal popup
+over the current pane:
+
+```
+  Jira PR — lprskavec/KR-1234-retry
+
+  p  #45 KR-1234 Fix the retry loop · In Review
+  j  KR-1234 in Jira
+  a  assign a ticket…
+  c  clear assigned KR-1234
+
+  esc  cancel
+```
+
+`p` opens the pull request in a browser, `j` opens the issue. `a` prompts for a
+key and pins it to this repo and branch, which is how you attach a ticket to work
+whose branch name does not carry one. A pinned ticket outranks the branch, is
+checked against Jira before it is accepted, and inherits the same expectation:
+it has to appear in the PR title. With no PR yet, a pinned ticket still shows, so
+you can see what an agent is supposed to be working on before it opens anything.
+
+```toml
+[[keys.command]]
+key = "prefix+o"
+type = "shell"
+command = "herdr plugin pane open --plugin abtris.jira-pr --entrypoint menu"
+```
+
+## Reading the ticket back
+
+The resolved key is reported as a second token, `$jira_key`, alongside the display
+line. Nothing renders it unless you add it to a sidebar row, but any agent in the
+pane can read its own assigned ticket and use it when it names a branch or writes
+a PR title:
+
+```bash
+herdr pane get "$HERDR_PANE_ID" | jq -r '.result.tokens.jira_key // empty'
+```
+
+`bash bin/jira-pr ticket` prints the same value for scripts, exiting non-zero when
+there is no ticket. Only a key Jira confirms is published, so a typo in a branch
+name never reaches an agent this way.
+
 ## Requirements
 
 `git`, `gh` (authenticated), `jq`, `curl`, and Herdr 0.8.0 or newer.
