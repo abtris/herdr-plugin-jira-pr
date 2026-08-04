@@ -17,10 +17,12 @@ EOF
 
 cat >"$stub_bin/gh" <<'EOF'
 #!/usr/bin/env bash
-# Only `gh pr list` is exercised; STUB_PR_JSON is the canned response.
+# Only `gh pr list` is exercised; STUB_PR_JSON is the canned response. Each call is
+# logged so a test can assert that an action did not go to the network.
 if [ "${1:-}" = "auth" ]; then
   exit 0
 fi
+printf 'gh %s\n' "$*" >>"${STUB_CALLS:-/dev/null}"
 printf '%s' "${STUB_PR_JSON:-[]}"
 EOF
 
@@ -125,7 +127,8 @@ run_case() {
 # exercises the same input path a terminal delivers.
 menu_case() {
   local name="$1" branch="$2" pr_json="$3" keys="$4" want_report="$5" want_pin="${6:-}"
-  local log="$work/herdr.log" state="$work/state-menu-$RANDOM" got pin toplevel
+  local want_gh="${7:-}"
+  local log="$work/herdr.log" state="$work/state-menu-$RANDOM" got pin toplevel gh_calls
   : >"$log"
   git -C "$repo" checkout -q -B "$branch"
   toplevel=$(git -C "$repo" rev-parse --show-toplevel)
@@ -134,6 +137,7 @@ menu_case() {
     STUB_HERDR_LOG="$log" \
     STUB_JIRA_DIR="$work/jira" \
     STUB_PR_JSON="$pr_json" \
+    STUB_CALLS="$state.gh" \
     HERDR_BIN_PATH="$stub_bin/herdr" \
     HERDR_PANE_ID="w1:p1" \
     HERDR_PLUGIN_CONFIG_DIR="$config_dir" \
@@ -148,10 +152,13 @@ menu_case() {
   got=$(cat "$log")
   pin=$(cat "$state/pins/$(printf "%s|%s" "$toplevel" "$branch" | shasum | cut -d' ' -f1)" \
     2>/dev/null || true)
-  if [ "$got" = "$want_report" ] && [ "$pin" = "$want_pin" ]; then
+  gh_calls=$(wc -l <"$state.gh" 2>/dev/null | tr -d ' ' || echo 0)
+  if [ "$got" = "$want_report" ] && [ "$pin" = "$want_pin" ] &&
+    { [ -z "$want_gh" ] || [ "$gh_calls" = "$want_gh" ]; }; then
     pass "$name"
   else
-    fail "$name" "report=[$want_report] pin=[$want_pin]" "report=[$got] pin=[$pin]"
+    fail "$name" "report=[$want_report] pin=[$want_pin] gh=[${want_gh:-any}]" \
+      "report=[$got] pin=[$pin] gh=[$gh_calls]"
   fi
 }
 
@@ -308,11 +315,24 @@ menu_case "escape closes the menu without reporting" \
   "$ESC" \
   ""
 
-menu_case "escape cancels the ticket prompt and pins nothing" \
+# Backing out must cost nothing: no report, and exactly the one gh call the menu
+# already made when it opened. Re-resolving here is what made Escape feel like a
+# two second hang.
+menu_case "escape cancels the ticket prompt without touching the network" \
   "spike/no-ticket" \
   '[{"number":60,"title":"spike: no ticket","body":""}]' \
   "a${ESC}${ESC}" \
-  "$prefix --token jira=#60 --ttl-ms 900000 --clear-token jira_key"
+  "" \
+  "" \
+  1
+
+menu_case "refresh does re-resolve" \
+  "spike/no-ticket" \
+  '[{"number":60,"title":"spike: no ticket","body":""}]' \
+  "r${ESC}" \
+  "$prefix --token jira=#60 --ttl-ms 900000 --clear-token jira_key" \
+  "" \
+  2
 
 menu_case "a ticket typed at the prompt is pinned and reported" \
   "spike/no-ticket" \
@@ -321,11 +341,13 @@ menu_case "a ticket typed at the prompt is pinned and reported" \
   "$prefix --token jira=⚠ #60 KR-1234 not in PR title --ttl-ms 900000 --token jira_key=KR-1234 --ttl-ms 900000" \
   KR-1234
 
-menu_case "a bad key at the prompt is refused" \
+menu_case "a bad key at the prompt is refused and changes nothing" \
   "spike/no-ticket" \
   '[{"number":60,"title":"spike: no ticket","body":""}]' \
   "anonsense${ENTER} ${ESC}" \
-  "$prefix --token jira=#60 --ttl-ms 900000 --clear-token jira_key"
+  "" \
+  "" \
+  1
 
 menu_case "backspace edits the ticket being typed" \
   "spike/no-ticket" \
