@@ -80,7 +80,7 @@ fail() {
 
 # Runs bin/jira-pr on a branch and prints what it reported to herdr.
 run_case() {
-  local name="$1" branch="$2" pr_json="$3" want="$4" down="${5:-0}"
+  local name="$1" branch="$2" pr_json="$3" want="$4" down="${5:-0}" cfg="${6:-$config_dir}"
   local log="$work/herdr.log" got
   : >"$log"
   git -C "$repo" checkout -q -B "$branch"
@@ -92,7 +92,7 @@ run_case() {
     STUB_PR_JSON="$pr_json" \
     HERDR_BIN_PATH="$stub_bin/herdr" \
     HERDR_PANE_ID="w1:p1" \
-    HERDR_PLUGIN_CONFIG_DIR="$config_dir" \
+    HERDR_PLUGIN_CONFIG_DIR="$cfg" \
     HERDR_PLUGIN_STATE_DIR="$work/state-$RANDOM" \
     HERDR_PLUGIN_CONTEXT_JSON="{\"focused_pane_id\":\"w1:p1\",\"focused_pane_cwd\":\"$repo\"}" \
       bash "$root/bin/jira-pr" refresh >/dev/null 2>"$work/stderr" || {
@@ -111,6 +111,8 @@ run_case() {
 jira_issue_fixture KR-1234 "Fix retry loop" "In Review"
 jira_issue_fixture KR-1240 "Unrelated work" "Backlog"
 jira_issue_fixture KRI-77 "Cluster incident triage" "Open"
+# Real summaries do carry stray whitespace; KR-14644 on the live instance does.
+jira_issue_fixture KR-2000 "  Padded summary  " "Done"
 
 prefix="pane report-metadata w1:p1 --source abtris.jira-pr"
 
@@ -186,6 +188,28 @@ run_case "Jira unreachable keeps the key but flags it" \
   '[{"number":45,"title":"KR-1234 Fix retry loop","body":""}]' \
   "$prefix --token jira=#45 KR-1234 · jira? --ttl-ms 900000" \
   1
+
+run_case "a padded Jira summary does not double the separator" \
+  "feat/kr-2000-padded" \
+  '[{"number":59,"title":"KR-2000 padded summary","body":""}]' \
+  "$prefix --token jira=#59 KR-2000 Padded summary · Done --ttl-ms 900000"
+
+# A token command that hangs must not hang the event hook. TOKEN_CMD_TIMEOUT is 1
+# here so the test is quick; the plugin defaults to 10 seconds.
+hang_config="$work/config-hang"
+mkdir -p "$hang_config"
+cat >"$hang_config/config.env" <<EOF
+JIRA_URL=http://jira.test
+JIRA_API_TOKEN_CMD="sleep 30"
+TOKEN_CMD_TIMEOUT=1
+GH_ACCOUNTS=
+EOF
+
+run_case "a hanging token command is bounded, not waited on" \
+  "feat/kr-1234-retry" \
+  '[{"number":58,"title":"KR-1234 Fix retry loop","body":""}]' \
+  "$prefix --token jira=#58 KR-1234 · jira? --ttl-ms 900000" \
+  0 "$hang_config"
 
 if [ "$failures" -gt 0 ]; then
   printf '\n%s test(s) failed\n' "$failures"
