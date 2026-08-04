@@ -105,6 +105,16 @@ jira_token() {
   fi
 }
 
+# Resolves the token into JIRA_API_TOKEN in the *current* process, so the nested
+# command substitutions that follow inherit it instead of each paying for the
+# secret manager again. Reaching 1Password costs about a second, and the mismatch
+# check alone looks up two or three issues.
+ensure_token() {
+  if [ -z "$JIRA_API_TOKEN" ] && [ -n "$JIRA_API_TOKEN_CMD" ]; then
+    JIRA_API_TOKEN=$(jira_token)
+  fi
+}
+
 # --- pane and repo discovery -------------------------------------------------
 
 pane_id() {
@@ -352,6 +362,9 @@ compose() {
   if [ -z "$pr" ]; then
     # No PR yet. A pinned ticket is still worth showing, so you can see what the
     # agent is supposed to be working on before it opens anything.
+    if [ -n "$pin" ]; then
+      ensure_token
+    fi
     if [ -n "$pin" ] && resolved=$(jira_issue "$pin"); then
       IFS="$SEP" read -r summary issue_status <<<"$resolved"
       line="$pin $(trim_summary "$summary")"
@@ -374,6 +387,12 @@ compose() {
   for key in $branch_keys; do candidates+="$key${SEP}branch"$'\n'; done
   for key in $title_keys; do candidates+="$key${SEP}PR title"$'\n'; done
   for key in $body_keys; do candidates+="$key${SEP}PR body"$'\n'; done
+
+  # Only reach for the token once there is something to look up. A chore or triage
+  # branch with no ticket anywhere should not pay a second to open 1Password.
+  if [ -n "$candidates" ]; then
+    ensure_token
+  fi
 
   resolved=$(printf '%s' "$candidates" | first_real_issue) && status=0 || status=$?
 
@@ -638,32 +657,34 @@ pause_message() {
   IFS= read -rsn1 _ || true
 }
 
-# Prompts for a ticket, validates it, and pins it to this repo and branch.
+# Prompts for a ticket, validates it, and pins it to this repo and branch. Returns
+# non-zero when nothing was pinned, so a cancelled prompt costs no network.
 menu_assign() {
   local repo_root="$1" branch="$2" entry
   if ! prompt_line "ticket: "; then
-    return 0
+    return 1
   fi
+  ensure_token
   entry=$(printf '%s' "$PROMPT_RESULT" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
   if [ -z "$entry" ]; then
-    return 0
+    return 1
   fi
   if ! printf '%s' "$entry" | grep -qiE "^$KEY_PATTERN$"; then
     pause_message "$entry does not look like a ticket key."
-    return 0
+    return 1
   fi
   # Confirm it exists before pinning, so a typo does not become the answer. With
   # no token there is nothing to check against, so accept it.
   if [ -n "$(jira_token)" ] && ! jira_issue_exists "$entry"; then
     pause_message "$entry is not in Jira."
-    return 0
+    return 1
   fi
   mkdir -p "$STATE_DIR/pins"
   printf '%s' "$entry" >"$(pin_file "$repo_root" "$branch")"
 }
 
 cmd_menu() {
-  local target repo repo_root branch value line pr_url key pin
+  local target repo repo_root branch value line pr_url key pin changed=0
 
   target=$(pane_id)
   repo=$(pane_repo "$target")
@@ -703,17 +724,29 @@ cmd_menu() {
         open_url "$JIRA_URL/browse/$key"
         return 0
         ;;
-      a) menu_assign "$repo_root" "$branch" ;;
-      c) rm -f "$(pin_file "$repo_root" "$branch")" ;;
-      r) ;;
+      a)
+        changed=0
+        if menu_assign "$repo_root" "$branch"; then
+          changed=1
+        fi
+        ;;
+      c)
+        rm -f "$(pin_file "$repo_root" "$branch")"
+        changed=1
+        ;;
+      r) changed=1 ;;
+      *) changed=0 ;;
     esac
 
-    # Every mutating choice re-resolves on the next pass, so the menu shows the
-    # new state instead of closing on you.
-    invalidate "$repo_root" "$branch"
-    value=$(resolve "$repo_root" "$branch")
-    IFS="$SEP" read -r line _ key <<<"$value"
-    report "$target" "$line" "$key"
+    # Only a choice that actually changed something re-resolves. Backing out of the
+    # prompt used to fall through to here and spend a gh and Jira round trip before
+    # redrawing, which read as a two second hang on Escape.
+    if [ "$changed" -eq 1 ]; then
+      invalidate "$repo_root" "$branch"
+      value=$(resolve "$repo_root" "$branch")
+      IFS="$SEP" read -r line _ key <<<"$value"
+      report "$target" "$line" "$key"
+    fi
   done
 }
 cmd_doctor() {
